@@ -2,25 +2,22 @@ var _ = require("underscore")
 var Net = require("net")
 var Tls = require("tls")
 var Http = require("http")
-var Https = require("https")
 var ClientRequest = Http.ClientRequest
 var Socket = require("./lib/socket")
 var TlsSocket = require("./lib/tls_socket")
 var EventEmitter = require("events").EventEmitter
 var InternalSocket = require("./lib/internal_socket")
 var Stubs = require("./lib/stubs")
-var Semver = require("semver")
 var slice = Function.call.bind(Array.prototype.slice)
 var normalizeConnectArgs = Net._normalizeConnectArgs || Net._normalizeArgs
 var createRequestAndResponse = Http._connectionListener
-var NODE_0_10 = Semver.satisfies(process.version, ">= 0.10 < 0.11")
 module.exports = Mitm
 
 function Mitm() {
   if (!(this instanceof Mitm))
     return Mitm.apply(Object.create(Mitm.prototype), arguments).enable()
 
-  this.stubs = new Stubs
+  this.stubs = new Stubs()
   this.on("request", addCrossReferences)
 
   return this
@@ -33,16 +30,14 @@ Mitm.prototype.addListener = EventEmitter.prototype.addListener
 Mitm.prototype.removeListener = EventEmitter.prototype.removeListener
 Mitm.prototype.emit = EventEmitter.prototype.emit
 
-if (Semver.satisfies(process.version, "^8.12 || >= 9.6")) {
-  var IncomingMessage = require("_http_incoming").IncomingMessage
-  var ServerResponse = require("_http_server").ServerResponse
-  var incomingMessageKey = require("_http_common").kIncomingMessage
-  var serverResponseKey = require("_http_server").kServerResponse
-  Mitm.prototype[serverResponseKey] = ServerResponse
-  Mitm.prototype[incomingMessageKey] = IncomingMessage
-}
+var IncomingMessage = Http.IncomingMessage
+var ServerResponse = Http.ServerResponse
+var incomingMessageKey = require("_http_common").kIncomingMessage
+var serverResponseKey = require("_http_server").kServerResponse
+Mitm.prototype[serverResponseKey] = ServerResponse
+Mitm.prototype[incomingMessageKey] = IncomingMessage
 
-Mitm.prototype.enable = function() {
+Mitm.prototype.enable = function () {
   // Connect is called synchronously.
   var netConnect = this.tcpConnect.bind(this, Net.connect)
   var tlsConnect = this.tlsConnect.bind(this, Tls.connect)
@@ -52,29 +47,24 @@ Mitm.prototype.enable = function() {
   this.stubs.stub(Http.Agent.prototype, "createConnection", netConnect)
   this.stubs.stub(Tls, "connect", tlsConnect)
 
-  if (NODE_0_10) {
-    // Node v0.10 sets createConnection on the object in the constructor.
-    this.stubs.stub(Http.globalAgent, "createConnection", netConnect)
-
-    // This will create a lot of sockets in tests, but that's the current price
-    // to pay until I find a better way to force a new socket for each
-    // connection.
-    this.stubs.stub(Http.globalAgent, "maxSockets", Infinity)
-    this.stubs.stub(Https.globalAgent, "maxSockets", Infinity)
-  }
-
   // ClientRequest.prototype.onSocket is called synchronously from
   // ClientRequest's constructor and is a convenient place to hook into new
   // ClientRequests.
-  this.stubs.stub(ClientRequest.prototype, "onSocket", _.compose(
-    ClientRequest.prototype.onSocket,
-    this.request.bind(this)
-  ))
+  // this.stubs.stub(
+  //   ClientRequest.prototype,
+  //   "onSocket",
+  //   [ClientRequest.prototype.onSocket, this.request.bind(this)].reduce(comp, id)
+  // );
+  this.stubs.stub(
+    ClientRequest.prototype,
+    "onSocket",
+    _.compose(ClientRequest.prototype.onSocket, this.request.bind(this))
+  )
 
   return this
 }
 
-Mitm.prototype.disable = function() {
+Mitm.prototype.disable = function () {
   return this.stubs.restore(), this
 }
 
@@ -84,15 +74,26 @@ Mitm.prototype.connect = function connect(orig, Socket, opts, done) {
   // Don't set client.connecting to false because there's nothing setting it
   // back to false later. Originally that was done in Socket.prototype.connect
   // and its afterConnect handler, but we're not calling that.
-  var client = new Socket(_.defaults({
-    handle: sockets[0],
+  var client = new Socket({
+    ...{
+      handle: sockets[0],
 
-    // Node v10 expects readable and writable to be set at Socket creation time.
-    readable: true,
-    writable: true
-  }, opts))
+      // Node v10 expects readable and writable to be set at Socket creation time.
+      readable: true,
+      writable: true,
+    },
+    ...opts,
+  })
 
   this.emit("connect", client, opts)
+  if (client.delay) {
+    const origSocket = orig.call(this, opts, done)
+    origSocket.pause()
+    setTimeout(() => {
+      origSocket.resume()
+    }, client.delay)
+    return origSocket
+  }
   if (client.bypassed) return orig.call(this, opts, done)
 
   // Don't use just "server" because socket.server is used in Node v8.12 and
@@ -100,11 +101,11 @@ Mitm.prototype.connect = function connect(orig, Socket, opts, done) {
   // classes. If unset, it's set to the used HTTP server (Mitm instance in our
   // case) in _http_server.js.
   // See also: https://github.com/nodejs/node/issues/13435.
-  var server = client.serverSocket = new Socket({
+  var server = (client.serverSocket = new Socket({
     handle: sockets[1],
     readable: true,
-    writable: true
-  })
+    writable: true,
+  }))
 
   this.emit("connection", server, opts)
 
@@ -117,9 +118,10 @@ Mitm.prototype.connect = function connect(orig, Socket, opts, done) {
   return client
 }
 
-Mitm.prototype.tcpConnect = function(orig, opts, done) {
+Mitm.prototype.tcpConnect = function (orig, opts, done) {
   var args = normalizeConnectArgs(slice(arguments, 1))
-  opts = args[0]; done = args[1]
+  opts = args[0]
+  done = args[1]
 
   // The callback is originally bound to the connect event in
   // Socket.prototype.connect.
@@ -130,9 +132,10 @@ Mitm.prototype.tcpConnect = function(orig, opts, done) {
   return client
 }
 
-Mitm.prototype.tlsConnect = function(orig, opts, done) {
+Mitm.prototype.tlsConnect = function (orig, opts, done) {
   var args = normalizeConnectArgs(slice(arguments, 1))
-  opts = args[0]; done = args[1]
+  opts = args[0]
+  done = args[1]
 
   var client = this.connect(orig, TlsSocket, opts, done)
   if (client.serverSocket == null) return client
@@ -151,13 +154,12 @@ Mitm.prototype.request = function request(socket) {
   // 387.» if ServerResponse.prototype.write is called from within the
   // "request" event handler. Call it in the next tick to work around that.
   var self = this
-  if (NODE_0_10) {
-    self = Object.create(this)
-    self.emit = _.compose(process.nextTick, Function.bind.bind(this.emit, this))
-  }
 
   createRequestAndResponse.call(self, socket.serverSocket)
   return socket
 }
 
-function addCrossReferences(req, res) { req.res = res; res.req = req }
+function addCrossReferences(req, res) {
+  req.res = res
+  res.req = req
+}
